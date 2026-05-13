@@ -6,7 +6,7 @@ Scraping paralelo en:
   2. Grandes Conservadores Independientes: Santiago, Vina del Mar, Valparaiso
   3. Portal Fojas (fojas.cl) - conservadores medianos/rurales
   4. Diario Oficial (diariooficial.interior.gob.cl) - sociedades espejo
-Consolidacion inteligente con DeepSeek (deepseek-chat)
+Consolidacion inteligente con IA
 """
 
 import asyncio
@@ -14,12 +14,52 @@ import re
 import json
 import os
 import sys
+import subprocess
 from typing import Optional
 from datetime import datetime
 
 import streamlit as st
 from playwright.async_api import async_playwright, TimeoutError as PwTimeout
 from openai import OpenAI
+
+# ---------------------------------------------------------------------------
+# Instalar Chromium automaticamente si no existe (entorno nube)
+# ---------------------------------------------------------------------------
+_CHROMIUM_INSTALLED = False
+
+
+def _ensure_chromium():
+    global _CHROMIUM_INSTALLED
+    if _CHROMIUM_INSTALLED:
+        return
+    # Verificar si ya existe el ejecutable de chromium
+    home = os.path.expanduser("~")
+    possible_paths = [
+        os.path.join(home, ".cache", "ms-playwright"),
+    ]
+    found = False
+    for base in possible_paths:
+        if os.path.isdir(base):
+            for d in os.listdir(base):
+                if "chromium" in d.lower():
+                    found = True
+                    break
+    if not found:
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"],
+                check=True, capture_output=True, timeout=120
+            )
+        except Exception:
+            try:
+                subprocess.run(
+                    [sys.executable, "-m", "playwright", "install", "chromium"],
+                    check=True, capture_output=True, timeout=120
+                )
+            except Exception:
+                pass
+    _CHROMIUM_INSTALLED = True
+
 
 # ---------------------------------------------------------------------------
 # Configuracion global
@@ -253,7 +293,7 @@ async def barrido_conservadores_digitales(rut: str, max_par: int = 5) -> list[di
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         )
         page = await ctx.new_page()
-        st.info("Extrayendo comunas desde Conservadores Digitales...")
+        st.info("Extrayendo comunas disponibles...")
         comunas = await extraer_comunas_cd(page)
         if not comunas:
             st.warning("Usando lista de respaldo de comunas.")
@@ -328,7 +368,7 @@ async def barrido_independientes(rut: str) -> list[dict]:
                 await pg.close()
                 await ctx.close()
 
-        st.info("Consultando Conservadores Independientes...")
+        st.info("Consultando Conservadores Regionales...")
         resultados = await asyncio.gather(*[tarea(n, u) for n, u in CONSERVADORES_INDEP])
         await browser.close()
         return resultados
@@ -368,7 +408,7 @@ async def barrido_fojas(rut: str) -> list[dict]:
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         )
         page = await ctx.new_page()
-        st.info("Consultando Portal Fojas...")
+        st.info("Consultando registros nacionales...")
         res = await consultar_fojas(page, rut)
         await page.close()
         await ctx.close()
@@ -432,7 +472,7 @@ async def barrido_diario_oficial(rut: str) -> list[dict]:
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         )
         page = await ctx.new_page()
-        st.info("Buscando en Diario Oficial (sociedades)...")
+        st.info("Buscando publicaciones oficiales...")
         res = await buscar_diario_oficial(page, rut)
         await page.close()
         await ctx.close()
@@ -441,9 +481,9 @@ async def barrido_diario_oficial(rut: str) -> list[dict]:
 
 
 # ===================================================================
-# MODULO 5: Consolidacion Inteligente con DeepSeek
+# MODULO 5: Consolidacion Inteligente
 # ===================================================================
-def consolidar_con_deepseek(client: OpenAI, raw_data: list[dict], rut: str) -> str:
+def consolidar_con_ia(client: OpenAI, raw_data: list[dict], rut: str) -> str:
     bloque_html = []
     for item in raw_data:
         fuente = item.get("fuente", "desconocida")
@@ -465,7 +505,7 @@ Tu tarea es analizar los resultados HTML de busquedas en Conservadores de Bienes
 Debes:
 1. Identificar TODAS las inscripciones vigentes encontradas para el RUT consultado en los Conservadores de Bienes Raices.
 2. Extraer para cada inscripcion: Comuna, Foja, Numero, Anio, y cualquier detalle adicional relevante.
-3. Identificar si el RUT aparece en el Diario Oficial como socio o representante de sociedades (sociedades espejo).
+3. Identificar si el RUT aparece en el Diario Oficial como socio o representante de sociedades.
 4. Eliminar duplicados (misma Foja+Numero+Anio en misma comuna).
 5. Ignorar paginas sin resultados o con errores.
 6. Ordenar los resultados de norte a sur de Chile.
@@ -488,7 +528,7 @@ Responde UNICAMENTE con un JSON valido con esta estructura:
   ],
   "sociedades": [
     {
-      "tipo": "Sociedad espejo / Extracto",
+      "tipo": "Sociedad / Extracto",
       "rut_sociedad": "76.123.456-7",
       "nombre_sociedad": "Nombre de la sociedad si se encuentra",
       "fecha_publicacion": "2024-01-15",
@@ -515,7 +555,7 @@ Si NO se encontraron inscripciones ni sociedades, responde:
         return response.choices[0].message.content
     except Exception as e:
         return json.dumps({
-            "resumen": f"Error al procesar con DeepSeek: {str(e)}",
+            "resumen": f"Error al procesar con IA: {str(e)}",
             "total_inscripciones": 0,
             "total_sociedades": 0,
             "inscripciones": [],
@@ -527,6 +567,9 @@ Si NO se encontraron inscripciones ni sociedades, responde:
 # INTERFAZ STREAMLIT
 # ===================================================================
 def main():
+    # Instalar Chromium si es necesario (entorno nube)
+    _ensure_chromium()
+
     st.set_page_config(
         page_title="Barrido Nacional de Bienes Raices",
         page_icon="house",
@@ -535,24 +578,15 @@ def main():
 
     st.title("Barrido Nacional de Bienes Raices por RUT")
     st.markdown("""
-    Consulta simultanea en **+80 Conservadores de Bienes Raices** de Chile + **Diario Oficial**:
-    - **Conservadores Digitales** (conservadoresdigitales.cl) - 80+ comunas en paralelo
-    - **Grandes Conservadores** - Santiago, Vina del Mar, Valparaiso
-    - **Portal Fojas** (fojas.cl) - Conservadores medianos y rurales
-    - **Diario Oficial** - Sociedades espejo y extractos
+    Consulta simultanea en **+80 Conservadores de Bienes Raices** de Chile:
+    - Red Nacional de Conservadores Digitales
+    - Grandes Conservadores Regionales
+    - Registros Nacionales Centralizados
+    - Publicaciones Oficiales
     """)
 
     with st.sidebar:
         st.header("Configuracion")
-
-        # Usar DeepSeek API Key desde secrets o input manual
-        deepseek_api_key = st.text_input(
-            "DeepSeek API Key",
-            type="password",
-            value=st.secrets.get("DEEPSEEK_API_KEY", ""),
-            help="API key de DeepSeek para consolidacion con deepseek-chat",
-            placeholder="sk-..."
-        )
 
         rut_input = st.text_input(
             "RUT del deudor",
@@ -563,30 +597,21 @@ def main():
         max_par = st.slider(
             "Consultas paralelas",
             min_value=1, max_value=15, value=5,
-            help="Maximo de consultas simultaneas a Conservadores Digitales"
+            help="Maximo de consultas simultaneas"
         )
 
-        incluir_digitales = st.checkbox("Conservadores Digitales", value=True)
-        incluir_independientes = st.checkbox("Grandes Conservadores", value=True)
-        incluir_fojas = st.checkbox("Portal Fojas", value=True)
-        incluir_diario = st.checkbox("Diario Oficial", value=True)
+        incluir_digitales = st.checkbox("Red Nacional de Conservadores", value=True)
+        incluir_independientes = st.checkbox("Grandes Conservadores Regionales", value=True)
+        incluir_fojas = st.checkbox("Registros Nacionales", value=True)
+        incluir_diario = st.checkbox("Publicaciones Oficiales", value=True)
 
         ejecutar = st.button("Iniciar Barrido Nacional", type="primary", use_container_width=True)
 
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Conservadores Digitales", "80+ comunas")
-    with col2:
-        st.metric("Independientes", "Santiago, Vina, Valpo")
-    with col3:
-        st.metric("Portal Fojas", "Centralizado")
-    with col4:
-        st.metric("Diario Oficial", "Sociedades")
-
     if ejecutar:
-        api_key = deepseek_api_key or st.secrets.get("DEEPSEEK_API_KEY", "")
+        # Leer API Key solo desde Secrets (nunca desde input del usuario)
+        api_key = st.secrets.get("DEEPSEEK_API_KEY", "")
         if not api_key:
-            st.error("Debes ingresar tu DeepSeek API Key en la barra lateral o configurar .streamlit/secrets.toml")
+            st.error("Error de configuracion del sistema. Contacte al administrador.")
             return
         if not rut_input:
             st.error("Debes ingresar un RUT.")
@@ -614,24 +639,24 @@ def main():
         # --- MODULO 1: Conservadores Digitales ---
         if incluir_digitales:
             with log_container:
-                st.subheader("Modulo 1: Conservadores Digitales")
+                st.subheader("Red Nacional de Conservadores")
             progress_bar.progress(int(modulos_ok / modulos_activos * 100),
-                                  text="Barriendo 80+ comunas en paralelo...")
+                                  text="Barriendo comunas en paralelo...")
             try:
                 r = asyncio.run(barrido_conservadores_digitales(rut, max_par))
                 all_results.extend(r)
                 enc = sum(1 for x in r if x.get("encontrado"))
                 with log_container:
-                    st.success(f"Conservadores Digitales: {enc} comunas con hallazgos.")
+                    st.success(f"{enc} comunas con hallazgos.")
             except Exception as e:
                 with log_container:
-                    st.error(f"Error en Conservadores Digitales: {e}")
+                    st.error(f"Error: {e}")
             modulos_ok += 1
 
         # --- MODULO 2: Independientes ---
         if incluir_independientes:
             with log_container:
-                st.subheader("Modulo 2: Grandes Conservadores")
+                st.subheader("Grandes Conservadores Regionales")
             progress_bar.progress(int(modulos_ok / modulos_activos * 100),
                                   text="Consultando Santiago, Vina, Valparaiso...")
             try:
@@ -639,53 +664,53 @@ def main():
                 all_results.extend(r)
                 enc = sum(1 for x in r if x.get("encontrado"))
                 with log_container:
-                    st.success(f"Independientes: {enc} con hallazgos.")
+                    st.success(f"{enc} con hallazgos.")
             except Exception as e:
                 with log_container:
-                    st.error(f"Error en Independientes: {e}")
+                    st.error(f"Error: {e}")
             modulos_ok += 1
 
         # --- MODULO 3: Portal Fojas ---
         if incluir_fojas:
             with log_container:
-                st.subheader("Modulo 3: Portal Fojas")
+                st.subheader("Registros Nacionales")
             progress_bar.progress(int(modulos_ok / modulos_activos * 100),
-                                  text="Consultando fojas.cl...")
+                                  text="Consultando registros...")
             try:
                 r = asyncio.run(barrido_fojas(rut))
                 all_results.extend(r)
                 enc = sum(1 for x in r if x.get("encontrado"))
                 with log_container:
-                    st.success(f"Portal Fojas: {'Hallazgos' if enc else 'Sin resultados'}.")
+                    st.success(f"{'Hallazgos' if enc else 'Sin resultados'}.")
             except Exception as e:
                 with log_container:
-                    st.error(f"Error en Portal Fojas: {e}")
+                    st.error(f"Error: {e}")
             modulos_ok += 1
 
         # --- MODULO 4: Diario Oficial ---
         if incluir_diario:
             with log_container:
-                st.subheader("Modulo 4: Diario Oficial")
+                st.subheader("Publicaciones Oficiales")
             progress_bar.progress(int(modulos_ok / modulos_activos * 100),
-                                  text="Buscando sociedades en Diario Oficial...")
+                                  text="Buscando publicaciones...")
             try:
                 r = asyncio.run(barrido_diario_oficial(rut))
                 all_results.extend(r)
                 enc = sum(1 for x in r if x.get("encontrado"))
                 with log_container:
-                    st.success(f"Diario Oficial: {'Sociedades encontradas' if enc else 'Sin resultados'}.")
+                    st.success(f"{'Publicaciones encontradas' if enc else 'Sin resultados'}.")
             except Exception as e:
                 with log_container:
-                    st.error(f"Error en Diario Oficial: {e}")
+                    st.error(f"Error: {e}")
             modulos_ok += 1
 
-        # --- MODULO 5: Consolidacion DeepSeek ---
-        progress_bar.progress(90, text="Consolidando con DeepSeek...")
+        # --- MODULO 5: Consolidacion IA ---
+        progress_bar.progress(90, text="Analizando resultados...")
         with log_container:
-            st.subheader("Consolidacion Inteligente (DeepSeek)")
+            st.subheader("Analisis Inteligente")
 
-        with st.spinner("Analizando y estructurando resultados con IA..."):
-            respuesta_ia = consolidar_con_deepseek(client, all_results, rut)
+        with st.spinner("Procesando y estructurando resultados..."):
+            respuesta_ia = consolidar_con_ia(client, all_results, rut)
 
         progress_bar.progress(100, text="Barrido completado!")
 
@@ -696,7 +721,7 @@ def main():
         try:
             datos = json.loads(respuesta_ia)
         except json.JSONDecodeError:
-            st.error("Error al parsear respuesta de DeepSeek. Mostrando crudo:")
+            st.error("Error al procesar resultados. Mostrando crudo:")
             st.text(respuesta_ia)
             return
 
@@ -750,7 +775,7 @@ def main():
 
         # Tabla de sociedades
         if sociedades:
-            st.subheader("Sociedades encontradas en Diario Oficial")
+            st.subheader("Sociedades encontradas")
             tbl_soc = []
             for idx, soc in enumerate(sociedades, 1):
                 tbl_soc.append({
@@ -783,22 +808,6 @@ def main():
             file_name=f"resultados_rut_{rut}.json",
             mime="application/json",
         )
-
-        # Detalles tecnicos
-        with st.expander("Ver detalles tecnicos de la consulta"):
-            st.json({
-                "rut": rut,
-                "modulos_activos": modulos_activos,
-                "total_consultas": len(all_results),
-                "con_hallazgos": sum(1 for r in all_results if r.get("encontrado")),
-                "con_error": sum(1 for r in all_results if r.get("error")),
-                "modulos": {
-                    "digitales": incluir_digitales,
-                    "independientes": incluir_independientes,
-                    "fojas": incluir_fojas,
-                    "diario_oficial": incluir_diario,
-                }
-            })
 
 
 if __name__ == "__main__":
