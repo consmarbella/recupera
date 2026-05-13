@@ -33,8 +33,16 @@ def _ensure_chromium():
     if _CHROMIUM_INSTALLED:
         return
 
-    # Las dependencias del sistema las instala packages.txt automaticamente
-    # Solo descargar/actualizar el binario de Chromium
+    # 1) Instalar dependencias del sistema via playwright install-deps
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install-deps", "chromium"],
+            check=False, capture_output=True, timeout=180
+        )
+    except Exception:
+        pass
+
+    # 2) Descargar/actualizar el binario de Chromium
     try:
         subprocess.run(
             [sys.executable, "-m", "playwright", "install", "chromium"],
