@@ -1,2 +1,2 @@
-libxml2
-libxslt
+libxml2-dev
+libxslt1-dev
