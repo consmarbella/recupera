@@ -1,7 +1,7 @@
 """
 Plataforma de Barrido Nacional de Bienes Raices por RUT Chileno
 ================================================================
-Scraping paralelo en:
+Scraping HTTP directo (sin navegador) en:
   1. Conservadores Digitales (conservadoresdigitales.cl) - 80+ comunas
   2. Grandes Conservadores Independientes: Santiago, Vina del Mar, Valparaiso
   3. Portal Fojas (fojas.cl) - conservadores medianos/rurales
@@ -9,32 +9,31 @@ Scraping paralelo en:
 Consolidacion inteligente con IA
 """
 
-import asyncio
-import re
 import json
-import os
-import sys
-import subprocess
+import re
+import time
 from typing import Optional
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait, Select
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, WebDriverException
-from webdriver_manager.chrome import ChromeDriverManager
+import requests
+from bs4 import BeautifulSoup
 from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # Configuracion global
 # ---------------------------------------------------------------------------
-NAV_TIMEOUT = 25
-PAGE_WAIT = 2
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
+}
+TIMEOUT = 30
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
 
 # Mapa comuna -> region (orden norte-sur)
 COMUNA_A_REGION = {
@@ -153,137 +152,61 @@ def normalizar_rut(rut: str) -> str:
     return rut.upper().replace(".", "").replace("-", "").strip()
 
 
-def extraer_options_select(driver) -> list[str]:
-    """Extrae opciones de cualquier select en la pagina."""
-    opciones = []
-    for select_tag in driver.find_elements(By.TAG_NAME, "select"):
-        for opt in select_tag.find_elements(By.TAG_NAME, "option"):
-            value = opt.get_attribute("value") or ""
-            texto = opt.text.strip()
-            if texto and value and value != "0" and texto.lower() not in ("seleccione", "", "todos"):
-                opciones.append(texto)
-    return opciones
-
-
-def crear_driver():
-    """Crea un driver de Chrome headless."""
-    chrome_options = Options()
-    chrome_options.add_argument("--headless=new")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--window-size=1920,1080")
-    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-    chrome_options.add_argument("--remote-debugging-port=0")
-    chrome_options.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
-    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    chrome_options.add_experimental_option("useAutomationExtension", False)
-
+def extraer_comunas_cd() -> list[str]:
+    """Extrae comunas del select de conservadoresdigitales.cl via HTTP."""
     try:
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=chrome_options)
-        return driver
+        r = SESSION.get("https://www.conservadoresdigitales.cl", timeout=TIMEOUT)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "lxml")
+        comunas = []
+        for select in soup.find_all("select"):
+            for opt in select.find_all("option"):
+                value = opt.get("value", "")
+                texto = opt.get_text(strip=True)
+                if texto and value and value != "0" and texto.lower() not in ("seleccione", "", "todos"):
+                    comunas.append(texto)
+        return comunas
     except Exception:
-        # Fallback: intentar con ChromeDriver del sistema
-        service = Service()
-        driver = webdriver.Chrome(service=service, options=chrome_options)
-        return driver
+        return []
 
 
-def buscar_input_rut(driver, rut: str) -> bool:
-    """Busca un input de RUT y lo rellena."""
-    selectores = [
-        "input[name*='rut' i]", "input[id*='rut' i]",
-        "input[placeholder*='rut' i]", "input#TxtRut",
-        "input#rut", "input#Rut",
-    ]
-    for sel in selectores:
-        try:
-            inp = driver.find_element(By.CSS_SELECTOR, sel)
-            inp.clear()
-            inp.send_keys(rut)
-            return True
-        except Exception:
-            continue
-    # Fallback: buscar cualquier input con 'rut' en placeholder o name
-    for inp in driver.find_elements(By.CSS_SELECTOR, "input[type='text'], input:not([type])"):
-        try:
-            ph = (inp.get_attribute("placeholder") or "").lower()
-            nm = (inp.get_attribute("name") or "").lower()
-            if "rut" in ph or "rut" in nm:
-                inp.clear()
-                inp.send_keys(rut)
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def click_boton_consultar(driver) -> bool:
-    """Busca y hace clic en el boton de consultar/buscar."""
-    selectores = [
-        "button[type='submit']", "input[type='submit']",
-        "//button[contains(text(),'Consultar')]",
-        "//button[contains(text(),'Buscar')]",
-        "//a[contains(text(),'Consultar')]",
-        "//input[contains(@value,'Consultar')]",
-        "//input[contains(@value,'Buscar')]",
-        "//button[contains(text(),'Filtrar')]",
-    ]
-    for sel in selectores:
-        try:
-            if sel.startswith("//"):
-                btn = driver.find_element(By.XPATH, sel)
-            else:
-                btn = driver.find_element(By.CSS_SELECTOR, sel)
-            btn.click()
-            return True
-        except Exception:
-            continue
-    return False
-
-
-# ===================================================================
-# MODULO 1: Conservadores Digitales (conservadoresdigitales.cl)
-# ===================================================================
-def extraer_comunas_cd(driver) -> list[str]:
-    driver.get("https://www.conservadoresdigitales.cl")
-    import time
-    time.sleep(3)
-    return extraer_options_select(driver)
-
-
-def consultar_cd_comuna(driver, rut: str, comuna: str) -> dict:
+def consultar_cd_comuna(rut: str, comuna: str) -> dict:
+    """Consulta una comuna en conservadoresdigitales.cl via HTTP POST."""
     res = {"fuente": "conservadoresdigitales", "comuna": comuna,
            "raw_html": "", "encontrado": False, "error": None}
     try:
-        driver.get("https://www.conservadoresdigitales.cl")
-        import time
-        time.sleep(2)
+        # Obtener pagina principal para cookies/tokens
+        s = SESSION.get("https://www.conservadoresdigitales.cl", timeout=TIMEOUT)
+        soup = BeautifulSoup(s.text, "lxml")
 
-        # Seleccionar comuna
-        for select_tag in driver.find_elements(By.TAG_NAME, "select"):
-            try:
-                Select(select_tag).select_by_visible_text(comuna)
-                time.sleep(0.8)
-                break
-            except Exception:
-                continue
+        # Buscar formulario y sus campos
+        form = soup.find("form")
+        if not form:
+            # Intentar POST directo
+            data = {"Rut": rut, "comuna": comuna}
+            r = SESSION.post("https://www.conservadoresdigitales.cl",
+                             data=data, timeout=TIMEOUT)
+        else:
+            action = form.get("action", "")
+            url = action if action.startswith("http") else \
+                  "https://www.conservadoresdigitales.cl" + action
+            inputs = form.find_all("input")
+            data = {}
+            for inp in inputs:
+                name = inp.get("name")
+                if name:
+                    data[name] = inp.get("value", "")
+            # Agregar RUT y comuna
+            data["Rut"] = rut
+            # Buscar select de comuna
+            for select in form.find_all("select"):
+                name = select.get("name")
+                if name:
+                    data[name] = comuna
+            r = SESSION.post(url, data=data, timeout=TIMEOUT)
 
-        buscar_input_rut(driver, rut)
-        time.sleep(0.5)
-        ok = click_boton_consultar(driver)
-        if not ok:
-            from selenium.webdriver.common.keys import Keys
-            from selenium.webdriver.common.action_chains import ActionChains
-            ActionChains(driver).send_keys(Keys.ENTER).perform()
-        time.sleep(3)
-
-        html = driver.page_source
-        res["raw_html"] = html
+        html = r.text
+        res["raw_html"] = html[:5000]
         txt = html.lower()
         if "no se encontraron" not in txt and "sin resultados" not in txt:
             if ("<table" in html or "resultado" in txt) and \
@@ -295,20 +218,16 @@ def consultar_cd_comuna(driver, rut: str, comuna: str) -> dict:
 
 
 def barrido_conservadores_digitales(rut: str, max_par: int = 5) -> list[dict]:
-    driver = crear_driver()
-    try:
-        st.info("Extrayendo comunas disponibles...")
-        comunas = extraer_comunas_cd(driver)
-        if not comunas:
-            st.warning("Usando lista de respaldo de comunas.")
-            comunas = list(COMUNA_A_REGION.keys())
-        st.info(f"{len(comunas)} comunas detectadas. Barriendo en paralelo...")
-    finally:
-        driver.quit()
+    st.info("Extrayendo comunas disponibles...")
+    comunas = extraer_comunas_cd()
+    if not comunas:
+        st.warning("Usando lista de respaldo de comunas.")
+        comunas = list(COMUNA_A_REGION.keys())
+    st.info(f"{len(comunas)} comunas detectadas. Barriendo en paralelo...")
 
     resultados = []
     with ThreadPoolExecutor(max_workers=max_par) as executor:
-        futuros = {executor.submit(_consultar_cd_wrapper, rut, c): c for c in comunas}
+        futuros = {executor.submit(consultar_cd_comuna, rut, c): c for c in comunas}
         for futuro in as_completed(futuros):
             try:
                 resultados.append(futuro.result())
@@ -321,14 +240,6 @@ def barrido_conservadores_digitales(rut: str, max_par: int = 5) -> list[dict]:
     return resultados
 
 
-def _consultar_cd_wrapper(rut: str, comuna: str) -> dict:
-    driver = crear_driver()
-    try:
-        return consultar_cd_comuna(driver, rut, comuna)
-    finally:
-        driver.quit()
-
-
 # ===================================================================
 # MODULO 2: Grandes Conservadores Independientes
 # ===================================================================
@@ -339,23 +250,35 @@ CONSERVADORES_INDEP = [
 ]
 
 
-def consultar_independiente(driver, url: str, rut: str, nombre: str) -> dict:
+def consultar_independiente(url: str, rut: str, nombre: str) -> dict:
     res = {"fuente": "independiente", "conservador": nombre,
            "raw_html": "", "encontrado": False, "error": None}
     try:
-        driver.get(url)
-        import time
-        time.sleep(3)
-        buscar_input_rut(driver, rut)
-        time.sleep(0.5)
-        ok = click_boton_consultar(driver)
-        if not ok:
-            from selenium.webdriver.common.keys import Keys
-            from selenium.webdriver.common.action_chains import ActionChains
-            ActionChains(driver).send_keys(Keys.ENTER).perform()
-        time.sleep(3)
-        html = driver.page_source
-        res["raw_html"] = html
+        # GET inicial
+        s = SESSION.get(url, timeout=TIMEOUT)
+        soup = BeautifulSoup(s.text, "lxml")
+
+        # Buscar formulario
+        form = soup.find("form")
+        if form:
+            action = form.get("action", "")
+            target = action if action.startswith("http") else url + action
+            inputs = form.find_all("input")
+            data = {}
+            for inp in inputs:
+                name = inp.get("name")
+                if name:
+                    data[name] = inp.get("value", "")
+            # Agregar RUT
+            data["Rut"] = rut
+            data["rut"] = rut
+            r = SESSION.post(target, data=data, timeout=TIMEOUT)
+        else:
+            # POST directo
+            r = SESSION.post(url, data={"Rut": rut, "rut": rut}, timeout=TIMEOUT)
+
+        html = r.text
+        res["raw_html"] = html[:5000]
         txt = html.lower()
         if "no se encontraron" not in txt and "sin resultados" not in txt:
             if "<table" in html or any(w in html for w in ["Foja", "Fojas", "Inscripcion"]):
@@ -368,35 +291,38 @@ def consultar_independiente(driver, url: str, rut: str, nombre: str) -> dict:
 def barrido_independientes(rut: str) -> list[dict]:
     resultados = []
     for nombre, url in CONSERVADORES_INDEP:
-        driver = crear_driver()
-        try:
-            st.info(f"Consultando {nombre}...")
-            resultados.append(consultar_independiente(driver, url, rut, nombre))
-        finally:
-            driver.quit()
+        st.info(f"Consultando {nombre}...")
+        resultados.append(consultar_independiente(url, rut, nombre))
     return resultados
 
 
 # ===================================================================
 # MODULO 3: Portal Fojas (fojas.cl)
 # ===================================================================
-def consultar_fojas(driver, rut: str) -> dict:
+def consultar_fojas(rut: str) -> dict:
     res = {"fuente": "fojas", "conservador": "general",
            "raw_html": "", "encontrado": False, "error": None}
     try:
-        driver.get("https://www.fojas.cl")
-        import time
-        time.sleep(2)
-        buscar_input_rut(driver, rut)
-        time.sleep(0.5)
-        ok = click_boton_consultar(driver)
-        if not ok:
-            from selenium.webdriver.common.keys import Keys
-            from selenium.webdriver.common.action_chains import ActionChains
-            ActionChains(driver).send_keys(Keys.ENTER).perform()
-        time.sleep(3)
-        html = driver.page_source
-        res["raw_html"] = html
+        s = SESSION.get("https://www.fojas.cl", timeout=TIMEOUT)
+        soup = BeautifulSoup(s.text, "lxml")
+        form = soup.find("form")
+        if form:
+            action = form.get("action", "")
+            target = action if action.startswith("http") else "https://www.fojas.cl" + action
+            inputs = form.find_all("input")
+            data = {}
+            for inp in inputs:
+                name = inp.get("name")
+                if name:
+                    data[name] = inp.get("value", "")
+            data["Rut"] = rut
+            data["rut"] = rut
+            r = SESSION.post(target, data=data, timeout=TIMEOUT)
+        else:
+            r = SESSION.post("https://www.fojas.cl",
+                             data={"Rut": rut, "rut": rut}, timeout=TIMEOUT)
+        html = r.text
+        res["raw_html"] = html[:5000]
         txt = html.lower()
         if "no se encontraron" not in txt and "sin resultados" not in txt:
             if "<table" in html or "resultado" in txt:
@@ -407,61 +333,43 @@ def consultar_fojas(driver, rut: str) -> dict:
 
 
 def barrido_fojas(rut: str) -> list[dict]:
-    driver = crear_driver()
-    try:
-        st.info("Consultando registros nacionales...")
-        return [consultar_fojas(driver, rut)]
-    finally:
-        driver.quit()
+    st.info("Consultando registros nacionales...")
+    return [consultar_fojas(rut)]
 
 
 # ===================================================================
 # MODULO 4: Diario Oficial (diariooficial.interior.gob.cl)
 # ===================================================================
-def buscar_diario_oficial(driver, rut: str) -> dict:
+def buscar_diario_oficial(rut: str) -> dict:
     res = {"fuente": "diario_oficial", "conservador": "nacional",
            "raw_html": "", "encontrado": False, "error": None}
     try:
-        driver.get("https://www.diariooficial.interior.gob.cl")
-        import time
-        time.sleep(3)
-
-        input_busqueda = None
-        selectores = [
-            "input[name*='buscar' i]", "input[name*='search' i]",
-            "input[id*='buscar' i]", "input[id*='search' i]",
-            "input[placeholder*='buscar' i]", "input[placeholder*='search' i]",
-            "input[type='text']",
-        ]
-        for sel in selectores:
-            try:
-                inp = driver.find_element(By.CSS_SELECTOR, sel)
-                input_busqueda = inp
-                break
-            except Exception:
-                continue
-
-        if input_busqueda:
-            input_busqueda.clear()
-            input_busqueda.send_keys(rut)
-            time.sleep(0.5)
-            ok = click_boton_consultar(driver)
-            if not ok:
-                for txt in ["Buscar", "Search", "Ir", "Filtrar"]:
-                    try:
-                        btn = driver.find_element(By.XPATH, f"//button[contains(text(),'{txt}')]")
-                        btn.click()
-                        break
-                    except Exception:
-                        continue
-                else:
-                    from selenium.webdriver.common.keys import Keys
-                    from selenium.webdriver.common.action_chains import ActionChains
-                    ActionChains(driver).send_keys(Keys.ENTER).perform()
-            time.sleep(3)
-
-        html = driver.page_source
-        res["raw_html"] = html
+        s = SESSION.get("https://www.diariooficial.interior.gob.cl",
+                        timeout=TIMEOUT)
+        soup = BeautifulSoup(s.text, "lxml")
+        form = soup.find("form")
+        if form:
+            action = form.get("action", "")
+            target = action if action.startswith("http") else \
+                     "https://www.diariooficial.interior.gob.cl" + action
+            inputs = form.find_all("input")
+            data = {}
+            for inp in inputs:
+                name = inp.get("name")
+                if name:
+                    data[name] = inp.get("value", "")
+            data["rut"] = rut
+            data["Rut"] = rut
+            data["q"] = rut
+            r = SESSION.post(target, data=data, timeout=TIMEOUT)
+        else:
+            r = SESSION.get(
+                "https://www.diariooficial.interior.gob.cl",
+                params={"q": rut, "rut": rut},
+                timeout=TIMEOUT
+            )
+        html = r.text
+        res["raw_html"] = html[:5000]
         txt = html.lower()
         if "no se encontraron" not in txt and "sin resultados" not in txt:
             palabras_clave = ["sociedad", "extracto", "constitucion",
@@ -474,12 +382,8 @@ def buscar_diario_oficial(driver, rut: str) -> dict:
 
 
 def barrido_diario_oficial(rut: str) -> list[dict]:
-    driver = crear_driver()
-    try:
-        st.info("Buscando publicaciones oficiales...")
-        return [buscar_diario_oficial(driver, rut)]
-    finally:
-        driver.quit()
+    st.info("Buscando publicaciones oficiales...")
+    return [buscar_diario_oficial(rut)]
 
 
 # ===================================================================
@@ -809,4 +713,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-       
