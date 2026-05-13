@@ -23,7 +23,7 @@ from playwright.async_api import async_playwright, TimeoutError as PwTimeout
 from openai import OpenAI
 
 # ---------------------------------------------------------------------------
-# Instalar Chromium automaticamente si no existe (entorno nube)
+# Instalar dependencias del sistema y Chromium (entorno nube Linux)
 # ---------------------------------------------------------------------------
 _CHROMIUM_INSTALLED = False
 
@@ -32,6 +32,25 @@ def _ensure_chromium():
     global _CHROMIUM_INSTALLED
     if _CHROMIUM_INSTALLED:
         return
+
+    # Intentar instalar dependencias del sistema via apt-get (Linux)
+    try:
+        subprocess.run(
+            ["apt-get", "update", "-qq"],
+            check=False, capture_output=True, timeout=60
+        )
+        subprocess.run(
+            ["apt-get", "install", "-y", "-qq",
+             "libglib2.0-0", "libnss3", "libnspr4",
+             "libatk-bridge2.0-0", "libdrm2", "libxkbcommon0",
+             "libxcomposite1", "libxdamage1", "libxrandr2",
+             "libgbm1", "libpango-1.0-0", "libcairo2",
+             "libasound2", "libatspi2.0-0", "libcups2"],
+            check=False, capture_output=True, timeout=120
+        )
+    except Exception:
+        pass
+
     # Verificar si ya existe el ejecutable de chromium
     home = os.path.expanduser("~")
     possible_paths = [
@@ -48,13 +67,13 @@ def _ensure_chromium():
         try:
             subprocess.run(
                 [sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"],
-                check=True, capture_output=True, timeout=120
+                check=True, capture_output=True, timeout=180
             )
         except Exception:
             try:
                 subprocess.run(
                     [sys.executable, "-m", "playwright", "install", "chromium"],
-                    check=True, capture_output=True, timeout=120
+                    check=True, capture_output=True, timeout=180
                 )
             except Exception:
                 pass
