@@ -33,25 +33,8 @@ def _ensure_chromium():
     if _CHROMIUM_INSTALLED:
         return
 
-    # Intentar instalar dependencias del sistema via apt-get (Linux)
-    try:
-        subprocess.run(
-            ["apt-get", "update", "-qq"],
-            check=False, capture_output=True, timeout=60
-        )
-        subprocess.run(
-            ["apt-get", "install", "-y", "-qq",
-             "libglib2.0-0", "libnss3", "libnspr4",
-             "libatk-bridge2.0-0", "libdrm2", "libxkbcommon0",
-             "libxcomposite1", "libxdamage1", "libxrandr2",
-             "libgbm1", "libpango-1.0-0", "libcairo2",
-             "libasound2", "libatspi2.0-0", "libcups2"],
-            check=False, capture_output=True, timeout=120
-        )
-    except Exception:
-        pass
-
-    # Instalar Chromium forzadamente (si ya existe, es rapido)
+    # Las dependencias del sistema las instala packages.txt automaticamente
+    # Solo descargar/actualizar el binario de Chromium
     try:
         subprocess.run(
             [sys.executable, "-m", "playwright", "install", "chromium"],
