@@ -174,6 +174,7 @@ def crear_driver():
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920,1080")
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_argument("--remote-debugging-port=0")
     chrome_options.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -186,7 +187,7 @@ def crear_driver():
         driver = webdriver.Chrome(service=service, options=chrome_options)
         return driver
     except Exception:
-        # Fallback: intentar con Chrome ya instalado
+        # Fallback: intentar con ChromeDriver del sistema
         service = Service()
         driver = webdriver.Chrome(service=service, options=chrome_options)
         return driver
