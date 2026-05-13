@@ -51,32 +51,15 @@ def _ensure_chromium():
     except Exception:
         pass
 
-    # Verificar si ya existe el ejecutable de chromium
-    home = os.path.expanduser("~")
-    possible_paths = [
-        os.path.join(home, ".cache", "ms-playwright"),
-    ]
-    found = False
-    for base in possible_paths:
-        if os.path.isdir(base):
-            for d in os.listdir(base):
-                if "chromium" in d.lower():
-                    found = True
-                    break
-    if not found:
-        try:
-            subprocess.run(
-                [sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"],
-                check=True, capture_output=True, timeout=180
-            )
-        except Exception:
-            try:
-                subprocess.run(
-                    [sys.executable, "-m", "playwright", "install", "chromium"],
-                    check=True, capture_output=True, timeout=180
-                )
-            except Exception:
-                pass
+    # Instalar Chromium forzadamente (si ya existe, es rapido)
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=False, capture_output=True, timeout=180
+        )
+    except Exception:
+        pass
+
     _CHROMIUM_INSTALLED = True
 
 
