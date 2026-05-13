@@ -17,48 +17,24 @@ import sys
 import subprocess
 from typing import Optional
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
-from playwright.async_api import async_playwright, TimeoutError as PwTimeout
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait, Select
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from webdriver_manager.chrome import ChromeDriverManager
 from openai import OpenAI
-
-# ---------------------------------------------------------------------------
-# Instalar dependencias del sistema y Chromium (entorno nube Linux)
-# ---------------------------------------------------------------------------
-_CHROMIUM_INSTALLED = False
-
-
-def _ensure_chromium():
-    global _CHROMIUM_INSTALLED
-    if _CHROMIUM_INSTALLED:
-        return
-
-    # 1) Instalar dependencias del sistema via playwright install-deps
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install-deps", "chromium"],
-            check=False, capture_output=True, timeout=180
-        )
-    except Exception:
-        pass
-
-    # 2) Descargar/actualizar el binario de Chromium
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            check=False, capture_output=True, timeout=180
-        )
-    except Exception:
-        pass
-
-    _CHROMIUM_INSTALLED = True
-
 
 # ---------------------------------------------------------------------------
 # Configuracion global
 # ---------------------------------------------------------------------------
-NAV_TIMEOUT = 25_000
-PAGE_WAIT = 2_000
+NAV_TIMEOUT = 25
+PAGE_WAIT = 2
 
 # Mapa comuna -> region (orden norte-sur)
 COMUNA_A_REGION = {
@@ -177,96 +153,135 @@ def normalizar_rut(rut: str) -> str:
     return rut.upper().replace(".", "").replace("-", "").strip()
 
 
-def extraer_options_select(html: str) -> list[str]:
-    patron = r'<option[^>]*value=["\']([^"\']*)["\'][^>]*>([^<]+)</option>'
-    matches = re.findall(patron, html, re.IGNORECASE)
+def extraer_options_select(driver) -> list[str]:
+    """Extrae opciones de cualquier select en la pagina."""
     opciones = []
-    for value, texto in matches:
-        t = texto.strip()
-        if t and value and value != "0" and t.lower() not in ("seleccione", "", "todos"):
-            opciones.append(t)
+    for select_tag in driver.find_elements(By.TAG_NAME, "select"):
+        for opt in select_tag.find_elements(By.TAG_NAME, "option"):
+            value = opt.get_attribute("value") or ""
+            texto = opt.text.strip()
+            if texto and value and value != "0" and texto.lower() not in ("seleccione", "", "todos"):
+                opciones.append(texto)
     return opciones
 
 
-async def buscar_input_rut(page, rut: str) -> bool:
+def crear_driver():
+    """Crea un driver de Chrome headless."""
+    chrome_options = Options()
+    chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_options.add_experimental_option("useAutomationExtension", False)
+
+    try:
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        return driver
+    except Exception:
+        # Fallback: intentar con Chrome ya instalado
+        service = Service()
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        return driver
+
+
+def buscar_input_rut(driver, rut: str) -> bool:
+    """Busca un input de RUT y lo rellena."""
     selectores = [
         "input[name*='rut' i]", "input[id*='rut' i]",
         "input[placeholder*='rut' i]", "input#TxtRut",
         "input#rut", "input#Rut",
     ]
     for sel in selectores:
-        inp = await page.query_selector(sel)
-        if inp:
-            await inp.fill("")
-            await inp.fill(rut)
+        try:
+            inp = driver.find_element(By.CSS_SELECTOR, sel)
+            inp.clear()
+            inp.send_keys(rut)
             return True
-    inputs = await page.query_selector_all("input[type='text'], input:not([type])")
-    for inp in inputs:
-        ph = (await inp.get_attribute("placeholder") or "").lower()
-        nm = (await inp.get_attribute("name") or "").lower()
-        if "rut" in ph or "rut" in nm:
-            await inp.fill("")
-            await inp.fill(rut)
-            return True
+        except Exception:
+            continue
+    # Fallback: buscar cualquier input con 'rut' en placeholder o name
+    for inp in driver.find_elements(By.CSS_SELECTOR, "input[type='text'], input:not([type])"):
+        try:
+            ph = (inp.get_attribute("placeholder") or "").lower()
+            nm = (inp.get_attribute("name") or "").lower()
+            if "rut" in ph or "rut" in nm:
+                inp.clear()
+                inp.send_keys(rut)
+                return True
+        except Exception:
+            continue
     return False
 
 
-async def click_boton_consultar(page) -> bool:
+def click_boton_consultar(driver) -> bool:
+    """Busca y hace clic en el boton de consultar/buscar."""
     selectores = [
         "button[type='submit']", "input[type='submit']",
-        "button:has-text('Consultar')", "button:has-text('Buscar')",
-        "a:has-text('Consultar')", "input[value*='Consultar' i]",
-        "input[value*='Buscar' i]", "button:has-text('Filtrar')",
+        "//button[contains(text(),'Consultar')]",
+        "//button[contains(text(),'Buscar')]",
+        "//a[contains(text(),'Consultar')]",
+        "//input[contains(@value,'Consultar')]",
+        "//input[contains(@value,'Buscar')]",
+        "//button[contains(text(),'Filtrar')]",
     ]
     for sel in selectores:
-        btn = await page.query_selector(sel)
-        if btn:
-            await btn.click()
+        try:
+            if sel.startswith("//"):
+                btn = driver.find_element(By.XPATH, sel)
+            else:
+                btn = driver.find_element(By.CSS_SELECTOR, sel)
+            btn.click()
             return True
+        except Exception:
+            continue
     return False
 
 
 # ===================================================================
 # MODULO 1: Conservadores Digitales (conservadoresdigitales.cl)
 # ===================================================================
-async def extraer_comunas_cd(page) -> list[str]:
-    await page.goto("https://www.conservadoresdigitales.cl",
-                    timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
-    await page.wait_for_timeout(3000)
-    for sel in ["select#CmbComuna", "select[name*='comuna' i]", "select[id*='comuna' i]"]:
-        el = await page.query_selector(sel)
-        if el:
-            html = await el.inner_html()
-            opts = extraer_options_select(f"<select>{html}</select>")
-            if opts:
-                return opts
-    html = await page.content()
-    return extraer_options_select(html)
+def extraer_comunas_cd(driver) -> list[str]:
+    driver.get("https://www.conservadoresdigitales.cl")
+    import time
+    time.sleep(3)
+    return extraer_options_select(driver)
 
 
-async def consultar_cd_comuna(page, rut: str, comuna: str) -> dict:
+def consultar_cd_comuna(driver, rut: str, comuna: str) -> dict:
     res = {"fuente": "conservadoresdigitales", "comuna": comuna,
            "raw_html": "", "encontrado": False, "error": None}
     try:
-        await page.goto("https://www.conservadoresdigitales.cl",
-                        timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
-        await page.wait_for_timeout(2000)
-        for sel in ["select#CmbComuna", "select[name*='comuna' i]", "select[id*='comuna' i]", "select"]:
-            el = await page.query_selector(sel)
-            if el:
-                try:
-                    await el.select_option(label=comuna)
-                    await page.wait_for_timeout(800)
-                    break
-                except Exception:
-                    continue
-        await buscar_input_rut(page, rut)
-        await page.wait_for_timeout(500)
-        ok = await click_boton_consultar(page)
+        driver.get("https://www.conservadoresdigitales.cl")
+        import time
+        time.sleep(2)
+
+        # Seleccionar comuna
+        for select_tag in driver.find_elements(By.TAG_NAME, "select"):
+            try:
+                Select(select_tag).select_by_visible_text(comuna)
+                time.sleep(0.8)
+                break
+            except Exception:
+                continue
+
+        buscar_input_rut(driver, rut)
+        time.sleep(0.5)
+        ok = click_boton_consultar(driver)
         if not ok:
-            await page.keyboard.press("Enter")
-        await page.wait_for_timeout(3000)
-        html = await page.content()
+            from selenium.webdriver.common.keys import Keys
+            from selenium.webdriver.common.action_chains import ActionChains
+            ActionChains(driver).send_keys(Keys.ENTER).perform()
+        time.sleep(3)
+
+        html = driver.page_source
         res["raw_html"] = html
         txt = html.lower()
         if "no se encontraron" not in txt and "sin resultados" not in txt:
@@ -278,39 +293,39 @@ async def consultar_cd_comuna(page, rut: str, comuna: str) -> dict:
     return res
 
 
-async def barrido_conservadores_digitales(rut: str, max_par: int = 5) -> list[dict]:
-    resultados = []
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        ctx = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        )
-        page = await ctx.new_page()
+def barrido_conservadores_digitales(rut: str, max_par: int = 5) -> list[dict]:
+    driver = crear_driver()
+    try:
         st.info("Extrayendo comunas disponibles...")
-        comunas = await extraer_comunas_cd(page)
+        comunas = extraer_comunas_cd(driver)
         if not comunas:
             st.warning("Usando lista de respaldo de comunas.")
             comunas = list(COMUNA_A_REGION.keys())
         st.info(f"{len(comunas)} comunas detectadas. Barriendo en paralelo...")
-        await page.close()
-        await ctx.close()
-        sem = asyncio.Semaphore(max_par)
+    finally:
+        driver.quit()
 
-        async def tarea(comuna):
-            async with sem:
-                c = await browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                )
-                p = await c.new_page()
-                try:
-                    return await consultar_cd_comuna(p, rut, comuna)
-                finally:
-                    await p.close()
-                    await c.close()
-
-        resultados = await asyncio.gather(*[tarea(c) for c in comunas])
-        await browser.close()
+    resultados = []
+    with ThreadPoolExecutor(max_workers=max_par) as executor:
+        futuros = {executor.submit(_consultar_cd_wrapper, rut, c): c for c in comunas}
+        for futuro in as_completed(futuros):
+            try:
+                resultados.append(futuro.result())
+            except Exception as e:
+                comuna = futuros[futuro]
+                resultados.append({
+                    "fuente": "conservadoresdigitales", "comuna": comuna,
+                    "raw_html": "", "encontrado": False, "error": str(e)
+                })
     return resultados
+
+
+def _consultar_cd_wrapper(rut: str, comuna: str) -> dict:
+    driver = crear_driver()
+    try:
+        return consultar_cd_comuna(driver, rut, comuna)
+    finally:
+        driver.quit()
 
 
 # ===================================================================
@@ -323,19 +338,22 @@ CONSERVADORES_INDEP = [
 ]
 
 
-async def consultar_independiente(page, url: str, rut: str, nombre: str) -> dict:
+def consultar_independiente(driver, url: str, rut: str, nombre: str) -> dict:
     res = {"fuente": "independiente", "conservador": nombre,
            "raw_html": "", "encontrado": False, "error": None}
     try:
-        await page.goto(url, timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
-        await page.wait_for_timeout(3000)
-        await buscar_input_rut(page, rut)
-        await page.wait_for_timeout(500)
-        ok = await click_boton_consultar(page)
+        driver.get(url)
+        import time
+        time.sleep(3)
+        buscar_input_rut(driver, rut)
+        time.sleep(0.5)
+        ok = click_boton_consultar(driver)
         if not ok:
-            await page.keyboard.press("Enter")
-        await page.wait_for_timeout(3000)
-        html = await page.content()
+            from selenium.webdriver.common.keys import Keys
+            from selenium.webdriver.common.action_chains import ActionChains
+            ActionChains(driver).send_keys(Keys.ENTER).perform()
+        time.sleep(3)
+        html = driver.page_source
         res["raw_html"] = html
         txt = html.lower()
         if "no se encontraron" not in txt and "sin resultados" not in txt:
@@ -346,44 +364,37 @@ async def consultar_independiente(page, url: str, rut: str, nombre: str) -> dict
     return res
 
 
-async def barrido_independientes(rut: str) -> list[dict]:
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-
-        async def tarea(nombre, url):
-            ctx = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            )
-            pg = await ctx.new_page()
-            try:
-                return await consultar_independiente(pg, url, rut, nombre)
-            finally:
-                await pg.close()
-                await ctx.close()
-
-        st.info("Consultando Conservadores Regionales...")
-        resultados = await asyncio.gather(*[tarea(n, u) for n, u in CONSERVADORES_INDEP])
-        await browser.close()
-        return resultados
+def barrido_independientes(rut: str) -> list[dict]:
+    resultados = []
+    for nombre, url in CONSERVADORES_INDEP:
+        driver = crear_driver()
+        try:
+            st.info(f"Consultando {nombre}...")
+            resultados.append(consultar_independiente(driver, url, rut, nombre))
+        finally:
+            driver.quit()
+    return resultados
 
 
 # ===================================================================
 # MODULO 3: Portal Fojas (fojas.cl)
 # ===================================================================
-async def consultar_fojas(page, rut: str) -> dict:
+def consultar_fojas(driver, rut: str) -> dict:
     res = {"fuente": "fojas", "conservador": "general",
            "raw_html": "", "encontrado": False, "error": None}
     try:
-        await page.goto("https://www.fojas.cl",
-                        timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
-        await page.wait_for_timeout(2000)
-        await buscar_input_rut(page, rut)
-        await page.wait_for_timeout(500)
-        ok = await click_boton_consultar(page)
+        driver.get("https://www.fojas.cl")
+        import time
+        time.sleep(2)
+        buscar_input_rut(driver, rut)
+        time.sleep(0.5)
+        ok = click_boton_consultar(driver)
         if not ok:
-            await page.keyboard.press("Enter")
-        await page.wait_for_timeout(3000)
-        html = await page.content()
+            from selenium.webdriver.common.keys import Keys
+            from selenium.webdriver.common.action_chains import ActionChains
+            ActionChains(driver).send_keys(Keys.ENTER).perform()
+        time.sleep(3)
+        html = driver.page_source
         res["raw_html"] = html
         txt = html.lower()
         if "no se encontraron" not in txt and "sin resultados" not in txt:
@@ -394,31 +405,26 @@ async def consultar_fojas(page, rut: str) -> dict:
     return res
 
 
-async def barrido_fojas(rut: str) -> list[dict]:
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        ctx = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        )
-        page = await ctx.new_page()
+def barrido_fojas(rut: str) -> list[dict]:
+    driver = crear_driver()
+    try:
         st.info("Consultando registros nacionales...")
-        res = await consultar_fojas(page, rut)
-        await page.close()
-        await ctx.close()
-        await browser.close()
-        return [res]
+        return [consultar_fojas(driver, rut)]
+    finally:
+        driver.quit()
 
 
 # ===================================================================
 # MODULO 4: Diario Oficial (diariooficial.interior.gob.cl)
 # ===================================================================
-async def buscar_diario_oficial(page, rut: str) -> dict:
+def buscar_diario_oficial(driver, rut: str) -> dict:
     res = {"fuente": "diario_oficial", "conservador": "nacional",
            "raw_html": "", "encontrado": False, "error": None}
     try:
-        url = "https://www.diariooficial.interior.gob.cl"
-        await page.goto(url, timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
-        await page.wait_for_timeout(3000)
+        driver.get("https://www.diariooficial.interior.gob.cl")
+        import time
+        time.sleep(3)
+
         input_busqueda = None
         selectores = [
             "input[name*='buscar' i]", "input[name*='search' i]",
@@ -427,25 +433,33 @@ async def buscar_diario_oficial(page, rut: str) -> dict:
             "input[type='text']",
         ]
         for sel in selectores:
-            inp = await page.query_selector(sel)
-            if inp:
+            try:
+                inp = driver.find_element(By.CSS_SELECTOR, sel)
                 input_busqueda = inp
                 break
+            except Exception:
+                continue
+
         if input_busqueda:
-            await input_busqueda.fill("")
-            await input_busqueda.fill(rut)
-            await page.wait_for_timeout(500)
-            ok = await click_boton_consultar(page)
+            input_busqueda.clear()
+            input_busqueda.send_keys(rut)
+            time.sleep(0.5)
+            ok = click_boton_consultar(driver)
             if not ok:
                 for txt in ["Buscar", "Search", "Ir", "Filtrar"]:
-                    btn = await page.query_selector(f"button:has-text('{txt}')")
-                    if btn:
-                        await btn.click()
+                    try:
+                        btn = driver.find_element(By.XPATH, f"//button[contains(text(),'{txt}')]")
+                        btn.click()
                         break
+                    except Exception:
+                        continue
                 else:
-                    await page.keyboard.press("Enter")
-            await page.wait_for_timeout(3000)
-        html = await page.content()
+                    from selenium.webdriver.common.keys import Keys
+                    from selenium.webdriver.common.action_chains import ActionChains
+                    ActionChains(driver).send_keys(Keys.ENTER).perform()
+            time.sleep(3)
+
+        html = driver.page_source
         res["raw_html"] = html
         txt = html.lower()
         if "no se encontraron" not in txt and "sin resultados" not in txt:
@@ -458,19 +472,13 @@ async def buscar_diario_oficial(page, rut: str) -> dict:
     return res
 
 
-async def barrido_diario_oficial(rut: str) -> list[dict]:
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        ctx = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        )
-        page = await ctx.new_page()
+def barrido_diario_oficial(rut: str) -> list[dict]:
+    driver = crear_driver()
+    try:
         st.info("Buscando publicaciones oficiales...")
-        res = await buscar_diario_oficial(page, rut)
-        await page.close()
-        await ctx.close()
-        await browser.close()
-        return [res]
+        return [buscar_diario_oficial(driver, rut)]
+    finally:
+        driver.quit()
 
 
 # ===================================================================
@@ -560,9 +568,6 @@ Si NO se encontraron inscripciones ni sociedades, responde:
 # INTERFAZ STREAMLIT
 # ===================================================================
 def main():
-    # Instalar Chromium si es necesario (entorno nube)
-    _ensure_chromium()
-
     st.set_page_config(
         page_title="Barrido Nacional de Bienes Raices",
         page_icon="house",
@@ -601,7 +606,6 @@ def main():
         ejecutar = st.button("Iniciar Barrido Nacional", type="primary", use_container_width=True)
 
     if ejecutar:
-        # Leer API Key solo desde Secrets (nunca desde input del usuario)
         api_key = st.secrets.get("DEEPSEEK_API_KEY", "")
         if not api_key:
             st.error("Error de configuracion del sistema. Contacte al administrador.")
@@ -615,7 +619,6 @@ def main():
             st.error("RUT invalido. Ej: 12345678-5")
             return
 
-        # Cliente OpenAI apuntando a DeepSeek
         client = OpenAI(
             api_key=api_key,
             base_url="https://api.deepseek.com"
@@ -636,7 +639,7 @@ def main():
             progress_bar.progress(int(modulos_ok / modulos_activos * 100),
                                   text="Barriendo comunas en paralelo...")
             try:
-                r = asyncio.run(barrido_conservadores_digitales(rut, max_par))
+                r = barrido_conservadores_digitales(rut, max_par)
                 all_results.extend(r)
                 enc = sum(1 for x in r if x.get("encontrado"))
                 with log_container:
@@ -653,7 +656,7 @@ def main():
             progress_bar.progress(int(modulos_ok / modulos_activos * 100),
                                   text="Consultando Santiago, Vina, Valparaiso...")
             try:
-                r = asyncio.run(barrido_independientes(rut))
+                r = barrido_independientes(rut)
                 all_results.extend(r)
                 enc = sum(1 for x in r if x.get("encontrado"))
                 with log_container:
@@ -670,7 +673,7 @@ def main():
             progress_bar.progress(int(modulos_ok / modulos_activos * 100),
                                   text="Consultando registros...")
             try:
-                r = asyncio.run(barrido_fojas(rut))
+                r = barrido_fojas(rut)
                 all_results.extend(r)
                 enc = sum(1 for x in r if x.get("encontrado"))
                 with log_container:
@@ -687,7 +690,7 @@ def main():
             progress_bar.progress(int(modulos_ok / modulos_activos * 100),
                                   text="Buscando publicaciones...")
             try:
-                r = asyncio.run(barrido_diario_oficial(rut))
+                r = barrido_diario_oficial(rut)
                 all_results.extend(r)
                 enc = sum(1 for x in r if x.get("encontrado"))
                 with log_container:
@@ -805,3 +808,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+       
